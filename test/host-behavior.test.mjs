@@ -166,7 +166,9 @@ const badArgs = await call(real.routes.get('/session-delete/api/preview'), { ses
 check('path-traversal id is rejected with 400', badArgs.status === 400, JSON.stringify(badArgs.payload));
 
 const missing = await call(real.routes.get('/session-delete/api/preview'), { sessionId: 'session-does-not-exist-0000' });
-check('unknown session reports missing', missing.status === 200 && missing.payload.missing === true && missing.payload.deletable === false, JSON.stringify(missing.payload));
+check('unknown session reports missing with no accounting',
+  missing.status === 200 && missing.payload.missing === true && missing.payload.cleanupOnly === true
+  && missing.payload.accounting.known === false, JSON.stringify(missing.payload));
 
 const listed = await fakePersistence(realRoot).list();
 const ordinary = listed.find((row) => row.header.origin === undefined && row.header.parentSession === undefined);
@@ -260,15 +262,43 @@ const stopped = await call(fixture.routes.get('/session-delete/api/delete'), { s
 check('stop-and-delete asks every provider to stop', fixture.stops.includes(activeId), JSON.stringify(fixture.stops));
 check('stop-and-delete removes the session', stopped.status === 200 && stopped.payload.deleted.includes(activeId), JSON.stringify(stopped.payload));
 
-// The archived-but-resident case still deletes, and keeps its archive gate.
+// The archived-but-resident case still deletes, and its archive mark is cleared.
 const archivedResidentDelete = await call(fixture.routes.get('/session-delete/api/delete'), { sessionId: archivedResidentId, stopActivity: true });
 check('an archived resident session deletes', archivedResidentDelete.status === 200
   && archivedResidentDelete.payload.deleted.includes(archivedResidentId), JSON.stringify(archivedResidentDelete.payload));
 check('the deleted archived resident session is gone from disk', !readdirSync(projectDir).includes(archivedResidentId));
-check('a resident session keeps its archive gate (no unarchive call)',
-  !registry.calls.some((call_) => call_[0] === 'unarchive' && call_[1] === archivedResidentId), JSON.stringify(registry.calls));
+check('a deleted session always clears its archive mark',
+  registry.calls.some((call_) => call_[0] === 'unarchive' && call_[1] === archivedResidentId), JSON.stringify(registry.calls));
 check('a resident session is detached from workspace accounting',
   registry.calls.some((call_) => call_[0] === 'detach' && call_[1] === archivedResidentId), JSON.stringify(registry.calls));
+
+// The reported dead end: the log is already gone, but the session is still
+// open in this process and still archived. It must be cleanable, not a refusal.
+const ghostId = 'session-77777777-7777-4777-8777-777777777777';
+const ghostRegistry = fakeRegistry({ archivedIds: [ghostId], memberIds: [ghostId] });
+const ghost = harness({ root: fixtureRoot, residentIds: [ghostId], registry: ghostRegistry });
+
+const ghostPreview = await call(ghost.routes.get('/session-delete/api/preview'), { sessionId: ghostId });
+check('a ghost row previews as missing but resident',
+  ghostPreview.payload.missing === true && ghostPreview.payload.resident === true, JSON.stringify(ghostPreview.payload));
+check('a ghost row reports its leftover accounting',
+  ghostPreview.payload.accounting.known === true && ghostPreview.payload.accounting.archived === true
+  && ghostPreview.payload.accounting.member === true, JSON.stringify(ghostPreview.payload.accounting));
+check('a ghost row is no longer a dead end', ghostPreview.payload.deletable === true
+  && ghostPreview.payload.cleanupOnly === true, JSON.stringify(ghostPreview.payload));
+
+const ghostDelete = await call(ghost.routes.get('/session-delete/api/delete'), { sessionId: ghostId, stopActivity: true });
+check('deleting a ghost row succeeds as a cleanup', ghostDelete.status === 200
+  && ghostDelete.payload.ok === true && ghostDelete.payload.cleanupOnly === true, JSON.stringify(ghostDelete.payload));
+check('the cleanup reports what it cleared', Array.isArray(ghostDelete.payload.cleaned)
+  && ghostDelete.payload.cleaned.some((entry) => entry.id === ghostId && entry.archived === true && entry.member === true),
+JSON.stringify(ghostDelete.payload.cleaned));
+check('the ghost id leaves the archive set', !ghostRegistry.archived.has(ghostId), JSON.stringify([...ghostRegistry.archived]));
+check('the ghost id leaves the workspace', !ghostRegistry.members.includes(ghostId), JSON.stringify(ghostRegistry.members));
+
+const deleteColdMissing = await call(ghost.routes.get('/session-delete/api/delete'), { sessionId: 'session-absent-0000' });
+check('a truly unknown session still reports 404', deleteColdMissing.status === 404
+  && deleteColdMissing.payload.code === 'missing', JSON.stringify(deleteColdMissing.payload));
 
 const deleted = await call(fixture.routes.get('/session-delete/api/delete'), { sessionId: parentId, includeDescendants: true });
 check('delete removes the session and its subagent family', deleted.status === 200 && deleted.payload.ok === true

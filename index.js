@@ -278,39 +278,50 @@ function removeProjectionCache(home, id) {
   }
 }
 
-/** Drop every workspace-side trace of a session that no longer exists on disk.
- * Display bookkeeping only, so failures are logged and never fatal.
+/** Drop every workspace-side trace of a session that no longer exists on disk:
+ * the archive mark, the pin mark and workspace membership. Display bookkeeping
+ * only, so failures are logged and never fatal.
  *
- * A resident session keeps its archived mark on purpose: the archive gate is
- * what stops a still-live in-process instance from writing a fresh log into the
- * directory we just removed. The row still leaves the sidebar, because the
- * session is gone from persistence. */
-async function forgetRecord(registry, id, resident) {
-  if (!registry) return;
-  if (!resident) {
-    try {
-      const archived = registry.archivedSessionIds;
-      if (Array.isArray(archived) && archived.includes(id)) await registry.unarchiveSession(id);
-    } catch {
-      /* already absent, or the registry refuses an unknown session */
+ * The archive mark is cleared even when the in-process instance is still
+ * resident. Keeping it was tried and reverted: the id then lingered in
+ * `archivedSessionIds` and kept a ghost row reachable for a session whose log
+ * was already gone, which is exactly the state a user cannot clean up.
+ *
+ * @returns the kinds actually cleared, so the caller can report what changed.
+ */
+async function forgetRecord(registry, id) {
+  const cleared = { archived: false, pinned: false, member: false };
+  if (!registry) return cleared;
+  try {
+    const archived = registry.archivedSessionIds;
+    if (Array.isArray(archived) && archived.includes(id)) {
+      await registry.unarchiveSession(id);
+      cleared.archived = true;
     }
+  } catch (error) {
+    log('archive mark not cleared:', id, msgOf(error));
   }
   try {
     const pinned = registry.pinnedSessionIds;
-    if (Array.isArray(pinned) && pinned.includes(id)) await registry.unpinSession(id);
-  } catch {
-    /* already absent */
+    if (Array.isArray(pinned) && pinned.includes(id)) {
+      await registry.unpinSession(id);
+      cleared.pinned = true;
+    }
+  } catch (error) {
+    log('pin mark not cleared:', id, msgOf(error));
   }
   try {
     for (const workspace of registry.list()) {
       if (Array.isArray(workspace.sessionIds) && workspace.sessionIds.includes(id)) {
         await workspace.detachSession(id);
+        cleared.member = true;
         break;
       }
     }
   } catch (error) {
     log('workspace accounting not updated:', id, msgOf(error));
   }
+  return cleared;
 }
 
 function apiJson(res, status, value) {
@@ -335,6 +346,33 @@ async function readJsonBody(req) {
   }
 }
 
+/** The display accounting a deleted session can still linger in: the archive
+ * set, the pin set, and workspace membership. Any of them can keep a ghost row
+ * reachable after the log is gone, so the cleanup path must be able to clear
+ * them without a log directory to delete. */
+function accountingOf(registry, id) {
+  const state = { archived: false, pinned: false, member: false, known: false };
+  if (!registry) return state;
+  try {
+    const archived = registry.archivedSessionIds;
+    state.archived = Array.isArray(archived) && archived.includes(id);
+  } catch { /* registry unavailable */ }
+  try {
+    const pinned = registry.pinnedSessionIds;
+    state.pinned = Array.isArray(pinned) && pinned.includes(id);
+  } catch { /* registry unavailable */ }
+  try {
+    for (const workspace of registry.list()) {
+      if (Array.isArray(workspace.sessionIds) && workspace.sessionIds.includes(id)) {
+        state.member = true;
+        break;
+      }
+    }
+  } catch { /* registry unavailable */ }
+  state.known = state.archived || state.pinned || state.member;
+  return state;
+}
+
 export default {
   name: 'dsh-session-delete-ui',
   inject: ['webServer', 'sessionPersistence'],
@@ -349,6 +387,7 @@ export default {
       const byId = new Map();
       for (const row of rows) byId.set(row.header.id, row.header);
 
+      const registry = ctx.get('workspaceRegistry');
       const descendants = collectCascade(rows, sessionId);
       const ids = [sessionId, ...descendants];
 
@@ -369,6 +408,7 @@ export default {
           resident: isResident(ctx, id),
           activity,
           active: activity.length > 0,
+          accounting: accountingOf(registry, id),
           sizeBytes: dir === undefined ? 0 : directorySize(dir),
         });
       }
@@ -411,10 +451,15 @@ export default {
         active: target.active,
         resident: target.resident,
         activity: target.activity,
+        accounting: target.accounting,
         missing: target.missing,
         dir: target.dir ?? null,
         sizeBytes: target.sizeBytes,
-        deletable: !target.missing && !target.active,
+        // Only running work blocks. A session whose log is already gone can
+        // still be cleaned up, so it stays "deletable" and the dialog offers
+        // the cleanup instead of a dead end.
+        deletable: !target.active,
+        cleanupOnly: target.missing,
         descendants: planned.planRows.slice(1).map((row) => ({
           id: row.id,
           sizeBytes: row.sizeBytes,
@@ -422,6 +467,7 @@ export default {
           resident: row.resident,
           active: row.active,
           activity: row.activity,
+          accounting: row.accounting,
         })),
         sessionsRoot: root,
       });
@@ -469,12 +515,8 @@ export default {
         });
         return;
       }
-      if (target.missing) {
-        apiJson(res, 404, { ok: false, code: 'missing', detail: '本地已无该会话的记录' });
-        return;
-      }
 
-      const report = { deleted: [], skippedActive: [], missing: [], failed: [] };
+      const report = { deleted: [], cleaned: [], skippedActive: [], missing: [], failed: [] };
       const rows = includeDescendants ? planned.planRows : [target];
 
       // Validate every target before removing anything: a refusal leaves the
@@ -511,19 +553,31 @@ export default {
       }
 
       // Bookkeeping after the files are gone: the row must never be hidden
-      // while its log is still present.
+      // while its log is still present. Ids whose log was already gone are
+      // included, so leftover archive / pin / membership accounting is cleaned
+      // instead of dead-ending the request.
       const residentById = new Map(rows.map((row) => [row.id, row.resident === true]));
       for (const id of report.deleted) removeProjectionCache(home, id);
       const registry = ctx.get('workspaceRegistry');
-      for (const id of report.deleted) await forgetRecord(registry, id, residentById.get(id) === true);
+      const cleanupTargets = [...new Set([...report.deleted, ...report.missing])];
+      for (const id of cleanupTargets) {
+        const cleared = await forgetRecord(registry, id);
+        if (cleared.archived || cleared.pinned || cleared.member) {
+          report.cleaned.push({ id, ...cleared });
+        }
+      }
 
-      const ok = report.deleted.length > 0 && report.failed.length === 0;
-      apiJson(res, ok ? 200 : 500, {
+      const ok = (report.deleted.length > 0 || report.cleaned.length > 0) && report.failed.length === 0;
+      apiJson(res, ok ? 200 : 404, {
         ok,
+        ...ok ? {} : { code: 'missing' },
         sessionId: body.sessionId,
+        cleanupOnly: report.deleted.length === 0,
         deleted: report.deleted,
+        cleaned: report.cleaned,
         skippedActive: report.skippedActive,
         missing: report.missing,
+        resident: residentById.get(body.sessionId) === true,
         failed: report.failed,
       });
     }

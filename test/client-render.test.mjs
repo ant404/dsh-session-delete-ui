@@ -239,6 +239,48 @@ const outdatedConfirm = outdatedDialog.elements.filter((element) => element.type
 check('an older Host half is reported instead of repeated', outdatedDialog.text.includes('dialog.hostOutdated'), outdatedDialog.text);
 check('an older Host half blocks the click', outdatedConfirm.props.disabled === true);
 
+// The reported dead end: the log is gone, the session is still open in the
+// process, and an archive mark is left over. It must offer a working cleanup.
+fetchReply = { ok: true, status: 200, json: async () => ({ ok: true, active: false, resident: true, missing: true, deletable: true, cleanupOnly: true, sizeBytes: 0, descendants: [], activity: [], accounting: { archived: true, pinned: false, member: false, known: true } }) };
+await injected.requestDelete('session-ghost', '你是什么模型');
+await new Promise((resolve) => setTimeout(resolve, 0));
+React.__resetHooks();
+const ghostDialog = render(overlay.Component, {
+  ...overlayProps, t: (key, params) => (params === undefined ? key : `${key}(${JSON.stringify(params)})`),
+});
+const ghostConfirm = ghostDialog.elements.filter((element) => element.type === 'button')
+  .find((element) => String(element.props.className).includes('dsd_danger'));
+check('a ghost row offers a cleanup instead of a dead end', ghostConfirm.props.disabled === false
+  && ghostDialog.text.includes('dialog.cleanup'), ghostDialog.text);
+check('a ghost row explains the leftover state', ghostDialog.text.includes('dialog.missingResident')
+  && ghostDialog.text.includes('dialog.leftover'), ghostDialog.text);
+
+// Log gone, nothing left to clear: the action is correctly unavailable.
+fetchReply = { ok: true, status: 200, json: async () => ({ ok: true, active: false, resident: false, missing: true, deletable: true, cleanupOnly: true, sizeBytes: 0, descendants: [], activity: [], accounting: { archived: false, pinned: false, member: false, known: false } }) };
+await injected.requestDelete('session-empty', 'Nothing left');
+await new Promise((resolve) => setTimeout(resolve, 0));
+React.__resetHooks();
+const emptyDialog = render(overlay.Component, {
+  ...overlayProps, t: (key, params) => (params === undefined ? key : `${key}(${JSON.stringify(params)})`),
+});
+const emptyConfirm = emptyDialog.elements.filter((element) => element.type === 'button')
+  .find((element) => String(element.props.className).includes('dsd_danger'));
+check('nothing-to-do rows disable the action', emptyConfirm.props.disabled === true
+  && emptyDialog.text.includes('dialog.missing'), emptyDialog.text);
+
+// The cleanup confirmation reports itself as a cleanup, not a deletion.
+fetchReply = { ok: true, status: 200, json: async () => ({ ok: true, active: false, resident: true, missing: true, deletable: true, cleanupOnly: true, sizeBytes: 0, descendants: [], activity: [], accounting: { archived: true, pinned: false, member: false, known: true } }) };
+await injected.requestDelete('session-ghost', '你是什么模型');
+await new Promise((resolve) => setTimeout(resolve, 0));
+fetchReply = { ok: true, status: 200, json: async () => ({ ok: true, cleanupOnly: true, deleted: [], cleaned: [{ id: 'session-ghost', archived: true }] }) };
+overlayProps.confirm();
+await new Promise((resolve) => setTimeout(resolve, 0));
+React.__resetHooks();
+const cleanupNotice = render(overlay.Component, {
+  ...overlayProps, t: (key, params) => (params === undefined ? key : `${key}(${JSON.stringify(params)})`),
+});
+check('a cleanup reports a cleanup notice', cleanupNotice.text.includes('notice.cleaned'), cleanupNotice.text);
+
 // Running work: named, and offered as stop-and-delete instead of a refusal.
 fetchReply = { ok: true, status: 200, json: async () => ({ ok: true, active: true, resident: true, missing: false, deletable: false, sizeBytes: 10, descendants: [], activity: [{ kind: 'turn', items: [] }, { kind: 'job', items: [{ id: 'job-1', label: 'Build task' }] }] }) };
 await injected.requestDelete('session-2', 'Busy session');
@@ -271,6 +313,7 @@ check('the dialog lists the subagent family it would take', cascadeDialog.text.i
 console.log('\nconfirm path');
 
 fetchCalls = [];
+refreshed.length = 0;
 fetchReply = { ok: true, status: 200, json: async () => ({ ok: true, deleted: ['session-3', 'c1', 'c2'] }) };
 overlayProps.confirm();
 await new Promise((resolve) => setTimeout(resolve, 0));

@@ -76,8 +76,8 @@ New-Item -ItemType Junction `
 
 | 路由 | 作用 |
 |---|---|
-| `POST /session-delete/api/preview` | 只读预检：是否已无记录、**active（在跑的工作）** 与 **resident（进程内仍驻留）**、活动工作清单、日志目录、占用空间、级联子代理列表 |
-| `POST /session-delete/api/delete` | 执行删除；`stopActivity: true` 时先走官方停止路径；返回 `deleted / skippedActive / missing / failed` 明细 |
+| `POST /session-delete/api/preview` | 只读预检：是否已无记录、**active（在跑的工作）** 与 **resident（进程内仍驻留）**、活动工作清单、**残留记账（归档/置顶/成员关系）**、日志目录、占用空间、级联子代理列表 |
+| `POST /session-delete/api/delete` | 执行删除；`stopActivity: true` 时先走官方停止路径；日志已不存在时转为残留清理；返回 `deleted / cleaned / skippedActive / missing / failed` 明细 |
 | `GET /session-delete/api/health` | 挂载自检（返回 sessions 根目录、持久化服务可用性、存活会话数） |
 
 删除顺序（**先文件、后账目**，任何失败都不会留下「已隐藏但没删掉」的半删状态）：
@@ -93,9 +93,12 @@ New-Item -ItemType Junction `
    不是符号链接/junction、realpath 后仍在 sessions 根内 —— 校验通过才进入删除；
 4. `rmSync(目录, { recursive: true })` 删除日志目录；
 5. 删除 `~/.dsh/storages/session_projcache/sessions/<id>.json`；
-6. 工作区账目：`unpinSession` / `detachSession`（仅显示与记账，失败只记日志）；
-   **resident 会话保留归档标记**——归档闸门正是阻止内存里那个实例往已删除目录重新写日志的开关；
-   冷会话则照常 `unarchiveSession` 清账。
+6. 工作区账目：`unarchiveSession` / `unpinSession` / `detachSession`（仅显示与记账，失败只记日志），
+   **resident 与否都清**。曾经为了保住归档闸门而保留归档标记，结果是日志删掉后 id 仍留在
+   `archivedSessionIds` 里，形成用户清不掉的「幽灵行」，该做法已回退；
+7. **残留清理路径**：日志目录已经不存在时，不删文件、只清第 6 步的三种记账，返回 `cleanupOnly: true`
+   与 `cleaned` 明细，不再用 404 把请求打死。删除一个「进程里还开着、但磁盘上已经没了」的会话时，
+   对话框会说明这一行会在关闭该会话或重启 DSH 后消失，并提供**「清除残留记录」**。
 
 子代理级联由 header 的 `origin === 'subagent'` + `parentSession` 推导，深度上限 6 层。
 比较 id 时同时接受带与不带 `session-` 前缀的写法（DSH 两种都在用）。
@@ -127,8 +130,8 @@ New-Item -ItemType Junction `
 
 | 检查 | 结果 |
 |---|---|
-| Host 行为测试 `node test/host-behavior.test.mjs` | **27/27 通过**：真实 sessions 根只读预检 + 隔离夹具上的真实删除与级联；**resident 空闲可删 / 有活拒绝 / 停止后放行 / resident 保留归档闸门 / 冷会话清归档 / 路径穿越拒绝 / 重复删除 404** |
-| Client 渲染测试 `node test/client-render.test.mjs` | **42/42 通过**：模块注册、两个 slot 的 id/order/locale、菜单项与对话框渲染、活动工作清单与「停止并删除」、resident 提示、旧版 Host 半的降级提示、确认→刷新→提示、失败保留对话框、缺失 locale 仍可渲染 |
+| Host 行为测试 `node test/host-behavior.test.mjs` | **35/35 通过**：真实 sessions 根只读预检 + 隔离夹具上的真实删除与级联；**resident 空闲可删 / 有活拒绝 / 停止后放行 / 清残留记账 / 幽灵行可清理 / 路径穿越拒绝 / 重复删除 404** |
+| Client 渲染测试 `node test/client-render.test.mjs` | **46/46 通过**：模块注册、两个 slot 的 id/order/locale、菜单项与对话框渲染、活动工作清单与「停止并删除」、resident 提示、**幽灵行「清除残留记录」**、无可清理时禁用、旧版 Host 半的降级提示、确认→刷新→提示 |
 | 运行中的应用（Host） | Host 已挂载：`GET /session-delete/api/health` → 200 |
 | 真实路由 | 普通会话 preview → `deletable: true` 并给出真实目录与体积；有活会话 `delete` → 409 |
 | 浏览器 Bundle | 按 `dsh-client-modules` 的 rev 规则计算 combo URL 后请求 → **200**，说明模块图已包含本插件的行 |
@@ -159,7 +162,9 @@ New-Item -ItemType Junction `
 - **只清理本插件的关注面**：`dsh-cost-meter` 等第三方插件自己的账本不会被清理；
 - **级联深度上限 6 层**；
 - **改了 Host 半要重启 DSH**：进程内的插件 JS 不会热替换；浏览器半改动需要刷新页面；
-- **resident 会话的内存实例**：删除后进程内仍持有该实例（应用重启后释放），所以保留归档闸门防止它再写日志。
+- **resident 会话的内存实例**：删除后进程内仍持有该实例（应用重启后释放），因此那一行可能**保留到关闭该会话或重启 DSH**；
+  这时再点删除会走「清除残留记录」并明确告知，不会卡在「会话不存在」；
+- **删掉一个仍开着的会话会出现「幽灵行」**：磁盘已空、内存还在。这是 Harness 没有会话释放接口导致的，插件只能清理记账并如实说明。
 
 ## 目录
 
@@ -171,8 +176,8 @@ dsh-session-delete-ui/
 ├── package.json                  dsh.bundle.patch + dsh.client（platform/immediately/inject）
 ├── icon.svg / locale/{zh,en}.json  插件管理器卡片
 └── test/
-    ├── host-behavior.test.mjs    Host 行为测试（27 项）
-    └── client-render.test.mjs    Client 渲染测试（42 项）
+    ├── host-behavior.test.mjs    Host 行为测试（35 项）
+    └── client-render.test.mjs    Client 渲染测试（46 项）
 ```
 
 ## License
@@ -198,8 +203,8 @@ archived, idle session, for example — is deletable; it keeps its archive gate 
 instance cannot write a fresh log into the directory just removed. Subagent descendants cascade;
 forked sessions never do. Files first, bookkeeping second.
 
-Verified locally: 27/27 host checks (real read-only planning + destructive run on an isolated
-fixture, including resident-idle, running, stop-then-delete, and archive-gate cases), 42/42 client
+Verified locally: 35/35 host checks (real read-only planning + destructive run on an isolated
+fixture, including resident-idle, running, stop-then-delete, and ghost-cleanup cases), 46/46 client
 checks (registration, rendering, guards, confirm flow), the live Host route
 (`GET /session-delete/api/health` → 200, live session delete → 409), and the served browser bundle
 (combo URL computed from `dsh-client-modules`' revision rule → 200). Visual appearance in the page
