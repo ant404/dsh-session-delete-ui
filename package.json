@@ -1,0 +1,54 @@
+{
+  "name": "dsh-session-delete-ui",
+  "version": "1.0.0",
+  "private": true,
+  "description": "DeepSeek Harness plugin: adds a permanent 「删除会话」 / Delete session action to the sidebar session row menu, with a themed confirmation dialog and a running-session guard. Ships a Host half plus a Web client half in one bundle.",
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "cordis",
+    "plugin",
+    "session",
+    "delete"
+  ],
+  "license": "MIT",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json"
+  },
+  "icon": "./icon.svg",
+  "meta": {
+    "title": "会话删除 / Session delete",
+    "description": "在左侧会话行的 ⋯ 菜单中增加「删除会话」：永久删除会话日志、投影缓存与工作区记录，并在删除前确认。"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "icon.svg",
+    "locale",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-api-session-controller",
+        "@deepseek-ai/dsh-client-ui-workspace",
+        "@deepseek-ai/dsh-client-ui-layout"
+      ]
+    }
+  }
+}

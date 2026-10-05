@@ -1,0 +1,9 @@
+# dsh-session-delete-ui — bundle patch layer.
+#
+# This package's `dsh.bundle.patch`: when the bundle is installed into a DSH
+# profile, the loader applies this patch over the profile's entry list and mounts
+# the plugin row. The Host half registers the JSON routes under
+# /session-delete/api; the client half declares its own slot registrations.
+- insert:
+    - id: dsh-session-delete-ui
+      name: dsh-session-delete-ui

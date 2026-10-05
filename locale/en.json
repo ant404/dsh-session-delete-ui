@@ -1,0 +1,4 @@
+{
+  "title": "Session delete",
+  "description": "Adds a Delete session action to the sidebar session row menu: permanently removes the session log, projection cache and workspace records, behind a confirmation dialog, and always refuses a running session."
+}
