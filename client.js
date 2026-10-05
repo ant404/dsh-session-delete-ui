@@ -36,17 +36,28 @@ window.__ModuleLoader__.load({
       'dialog.warning': '此操作不可恢复：将删除该会话的本地日志、投影缓存与工作区记录。',
       'dialog.children': '同时会删除 {n} 个子代理会话。',
       'dialog.size': '将释放约 {size}。',
-      'dialog.running': '该会话正在运行或已打开，请先停止它再删除。',
+      'dialog.activity.title': '该会话仍有正在运行的工作，删除前会先停止它们：',
+      'dialog.activity.turn': '进行中的回合',
+      'dialog.activity.subagent': '运行中的子代理',
+      'dialog.activity.job': '后台任务',
+      'dialog.activity.schedule': '定时提醒',
+      'dialog.activity.other': '其他工作',
+      'dialog.activity.separator': '、',
+      'dialog.resident': '该会话仍在本进程内存中驻留（已打开或被保留）；日志与缓存会立即删除，内存实例在应用重启后释放。',
+      'dialog.hostOutdated': '插件的 Host 半还是旧版本（浏览器半已更新）：旧版会把「内存中驻留但没在运行」的会话误判为正在运行。请重启 DSH 后再删除。',
       'dialog.missing': '本地已无该会话的记录，无需删除。',
       'dialog.checking': '正在检查…',
       'dialog.previewError': '无法读取该会话的存储信息；仍可尝试删除，失败时会给出原因。',
       'dialog.cancel': '取消',
       'dialog.confirm': '永久删除',
+      'dialog.stopAndDelete': '停止并删除',
       'dialog.deleting': '正在删除…',
       'dialog.close': '关闭',
       'notice.deleted': '已删除会话「{title}」',
       'notice.failed': '删除失败：{reason}',
-      'error.live': '该会话正在运行或已打开',
+      'error.active': '该会话仍有正在运行的工作',
+      'error.stillActive': '停止后仍有工作在执行，请稍后重试',
+      'error.hostOutdated': 'Host 半需要重启 DSH 才能更新',
       'error.missing': '本地已无该会话的记录',
       'error.generic': '删除失败',
     };
@@ -58,17 +69,28 @@ window.__ModuleLoader__.load({
       'dialog.warning': 'This cannot be undone: the session log, its projection cache and its workspace records are removed.',
       'dialog.children': 'It also deletes {n} subagent session(s).',
       'dialog.size': 'Frees about {size}.',
-      'dialog.running': 'This session is running or open. Stop it first, then delete.',
+      'dialog.activity.title': 'This session still has work running; deleting stops it first:',
+      'dialog.activity.turn': 'Turn in progress',
+      'dialog.activity.subagent': 'Running subagents',
+      'dialog.activity.job': 'Background jobs',
+      'dialog.activity.schedule': 'Scheduled reminders',
+      'dialog.activity.other': 'Other work',
+      'dialog.activity.separator': ', ',
+      'dialog.resident': 'This session is still resident in the running process (open or retained). Its log and cache are removed now; the in-memory instance is released when the app restarts.',
+      'dialog.hostOutdated': 'The plugin Host half is still the older version (the browser half already updated): it mistakes a merely resident session for a running one. Restart DSH, then delete again.',
       'dialog.missing': 'No local record of this session remains; nothing to delete.',
       'dialog.checking': 'Checking…',
       'dialog.previewError': 'Could not read this session storage; deletion may still be attempted and will report its own failure.',
       'dialog.cancel': 'Cancel',
       'dialog.confirm': 'Delete permanently',
+      'dialog.stopAndDelete': 'Stop and delete',
       'dialog.deleting': 'Deleting…',
       'dialog.close': 'Close',
       'notice.deleted': 'Deleted session "{title}"',
       'notice.failed': 'Delete failed: {reason}',
-      'error.live': 'This session is running or open',
+      'error.active': 'This session still has running work',
+      'error.stillActive': 'Work is still stopping; try again in a moment',
+      'error.hostOutdated': 'The Host half needs a DSH restart to update',
       'error.missing': 'No local record of this session remains',
       'error.generic': 'Delete failed',
     };
@@ -91,6 +113,7 @@ window.__ModuleLoader__.load({
       '.dsd_description{margin:0;padding:0 24px;font-size:14px;line-height:22px;color:var(--dsw-alias-label-primary);overflow-wrap:anywhere}',
       '.dsd_body{display:flex;flex-direction:column;gap:6px;margin-top:20px;padding:0 24px;font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary)}',
       '.dsd_line{overflow-wrap:anywhere}',
+      '.dsd_activity{margin:0;padding-left:18px;display:flex;flex-direction:column;gap:2px}',
       '.dsd_warn{color:var(--dsw-alias-state-error-primary)}',
       '.dsd_footer{display:flex;align-items:center;justify-content:flex-end;gap:8px;padding:0 24px}',
       '.dsd_btn{box-sizing:border-box;display:inline-flex;align-items:center;justify-content:center;gap:4px;height:36px;padding:0 14px;border:none;border-radius:var(--dsw-radius-md);cursor:pointer;font-size:14px;line-height:22px;color:var(--dsw-alias-label-primary);background:transparent}',
@@ -239,18 +262,42 @@ window.__ModuleLoader__.load({
       var preview = state.preview;
       var previewError = state.previewError;
       var checking = preview === null && previewError === null;
-      var live = preview !== null && preview.live === true;
+      var active = preview !== null && preview.active === true;
+      var resident = preview !== null && preview.resident === true;
       var missing = preview !== null && preview.missing === true;
+      // An older Host half reports `live` and cannot tell running work from a
+      // merely resident instance; say so instead of repeating its wrong refusal.
+      var hostOutdated = preview !== null && preview.active === undefined && preview.live === true;
+      var activity = preview !== null && Array.isArray(preview.activity) ? preview.activity : [];
       var descendants = preview !== null && Array.isArray(preview.descendants) ? preview.descendants.length : 0;
-      var canDelete = !busy && !checking && !live && !missing;
+      var canDelete = !busy && !checking && !missing && !hostOutdated;
 
       var lines = [h('div', { key: 'warn', className: 'dsd_line dsd_warn' }, t('dialog.warning'))];
       if (checking) lines.push(h('div', { key: 'checking', className: 'dsd_line' }, t('dialog.checking')));
       if (previewError !== null) lines.push(h('div', { key: 'preview-error', className: 'dsd_line' }, t('dialog.previewError')));
-      if (live) lines.push(h('div', { key: 'live', className: 'dsd_line dsd_warn' }, t('dialog.running')));
+      if (hostOutdated) lines.push(h('div', { key: 'host-outdated', className: 'dsd_line dsd_warn' }, t('dialog.hostOutdated')));
+      if (active) {
+        // Work is still running: name the families so the reader knows what the
+        // stop button will cancel, then let the primary action stop and delete.
+        lines.push(h('div', { key: 'active-title', className: 'dsd_line dsd_warn' }, t('dialog.activity.title')));
+        var families = [];
+        for (var i = 0; i < activity.length; i += 1) {
+          var kind = activity[i] && typeof activity[i].kind === 'string' ? activity[i].kind : 'other';
+          var items = activity[i] && Array.isArray(activity[i].items) ? activity[i].items : [];
+          var names = items.map(function (item) { return item && item.label ? item.label : (item && item.id ? item.id : ''); })
+            .filter(function (name) { return name !== ''; });
+          var label = t('dialog.activity.' + kind);
+          families.push(names.length > 0 ? label + '：' + names.join(t('dialog.activity.separator')) : label);
+        }
+        lines.push(h('ul', { key: 'active-list', className: 'dsd_activity' },
+          families.map(function (line, index) { return h('li', { key: 'activity-' + String(index) }, line); })));
+      }
       if (missing) lines.push(h('div', { key: 'missing', className: 'dsd_line' }, t('dialog.missing')));
+      if (resident && !active && !missing) {
+        lines.push(h('div', { key: 'resident', className: 'dsd_line' }, t('dialog.resident')));
+      }
       if (descendants > 0) lines.push(h('div', { key: 'children', className: 'dsd_line' }, t('dialog.children', { n: descendants })));
-      if (preview !== null && !live && !missing) {
+      if (preview !== null && !missing) {
         var bytes = (typeof preview.sizeBytes === 'number' ? preview.sizeBytes : 0)
           + (Array.isArray(preview.descendants) ? preview.descendants.reduce(function (sum, entry) {
             return sum + (entry && typeof entry.sizeBytes === 'number' ? entry.sizeBytes : 0);
@@ -258,9 +305,11 @@ window.__ModuleLoader__.load({
         if (bytes > 0) lines.push(h('div', { key: 'size', className: 'dsd_line' }, t('dialog.size', { size: formatBytes(bytes) })));
       }
       if (state.errorCode !== null || state.errorDetail !== null) {
-        var reason = state.errorCode === 'live' ? t('error.live')
-          : state.errorCode === 'missing' ? t('error.missing')
-            : (state.errorDetail !== null && state.errorDetail !== '' ? state.errorDetail : t('error.generic'));
+        var reason = state.errorCode === 'active' ? t('error.active')
+          : state.errorCode === 'still-active' ? t('error.stillActive')
+            : state.errorCode === 'live' ? t('error.hostOutdated')
+              : state.errorCode === 'missing' ? t('error.missing')
+                : (state.errorDetail !== null && state.errorDetail !== '' ? state.errorDetail : t('error.generic'));
         lines.push(h('div', { key: 'error', className: 'dsd_line dsd_warn' }, reason));
       }
 
@@ -295,7 +344,7 @@ window.__ModuleLoader__.load({
               h('button', {
                 type: 'button', className: 'dsd_btn dsd_outline dsd_danger',
                 disabled: !canDelete, onClick: confirm,
-              }, busy ? t('dialog.deleting') : t('dialog.confirm')),
+              }, busy ? t('dialog.deleting') : (active ? t('dialog.stopAndDelete') : t('dialog.confirm'))),
             ),
           ),
         ),
@@ -373,7 +422,7 @@ window.__ModuleLoader__.load({
         var current = store.get();
         if (current === null || current.kind !== 'dialog' || current.busy === true) return;
         store.set(Object.assign({}, current, { busy: true, errorCode: null, errorDetail: null }));
-        callApi('delete', { sessionId: current.sessionId, includeDescendants: true }).then(function (result) {
+        callApi('delete', { sessionId: current.sessionId, includeDescendants: true, stopActivity: true }).then(function (result) {
           setNotice('ok', { textKey: 'notice.deleted', title: current.displayTitle, action: { kind: 'deleted', sessionId: current.sessionId, deleted: result.deleted } });
           refreshCatalog(ctx);
         }).catch(function (error) {

@@ -178,7 +178,7 @@ check('the row survives a missing locale seat', withoutLocale.text.includes('men
 console.log('\ndialog');
 
 let fetchCalls = [];
-let fetchReply = { ok: true, status: 200, json: async () => ({ ok: true, live: false, missing: false, deletable: true, sizeBytes: 2048, descendants: [] }) };
+let fetchReply = { ok: true, status: 200, json: async () => ({ ok: true, active: false, resident: false, missing: false, deletable: true, sizeBytes: 2048, descendants: [], activity: [] }) };
 globalThis.fetch = async (url, init) => {
   fetchCalls.push({ url: String(url), body: init && init.body ? JSON.parse(init.body) : null });
   return fetchReply;
@@ -211,21 +211,54 @@ const confirmButton = dialog.elements.filter((element) => element.type === 'butt
 check('the delete button is enabled for a deletable session', confirmButton.props.disabled === false);
 check('the dialog reports the size it will free', dialog.text.includes('2048') || dialog.text.includes('2.0 KB'), dialog.text);
 
-// A live session must be refused before the click.
-fetchReply = { ok: true, status: 200, json: async () => ({ ok: true, live: true, missing: false, deletable: false, sizeBytes: 10, descendants: [] }) };
-await injected.requestDelete('session-2', 'Running session');
+// The reported regression: resident but idle must not be refused.
+fetchReply = { ok: true, status: 200, json: async () => ({ ok: true, active: false, resident: true, missing: false, deletable: true, sizeBytes: 10, descendants: [], activity: [] }) };
+await injected.requestDelete('session-resident', 'Archived but resident');
 await new Promise((resolve) => setTimeout(resolve, 0));
 React.__resetHooks();
-const liveDialog = render(overlay.Component, {
+const residentDialog = render(overlay.Component, {
   ...overlayProps, t: (key, params) => (params === undefined ? key : `${key}(${JSON.stringify(params)})`),
 });
-const liveConfirm = liveDialog.elements.filter((element) => element.type === 'button')
+const residentConfirm = residentDialog.elements.filter((element) => element.type === 'button')
   .find((element) => String(element.props.className).includes('dsd_danger'));
-check('a running session cannot be confirmed', liveConfirm.props.disabled === true);
-check('the dialog explains why it is refused', liveDialog.text.includes('dialog.running'), liveDialog.text);
+check('a resident but idle session can be confirmed', residentConfirm.props.disabled === false);
+check('the dialog explains residency without claiming it is running',
+  residentDialog.text.includes('dialog.resident') && !residentDialog.text.includes('dialog.activity.title'), residentDialog.text);
+check('a resident but idle session keeps the plain delete label', residentDialog.text.includes('dialog.confirm'), residentDialog.text);
+
+// An older Host half (which only knows `live`) is named, not echoed.
+fetchReply = { ok: true, status: 200, json: async () => ({ ok: true, live: true, missing: false, deletable: false, sizeBytes: 10, descendants: [] }) };
+await injected.requestDelete('session-old-host', 'Old host half');
+await new Promise((resolve) => setTimeout(resolve, 0));
+React.__resetHooks();
+const outdatedDialog = render(overlay.Component, {
+  ...overlayProps, t: (key, params) => (params === undefined ? key : `${key}(${JSON.stringify(params)})`),
+});
+const outdatedConfirm = outdatedDialog.elements.filter((element) => element.type === 'button')
+  .find((element) => String(element.props.className).includes('dsd_danger'));
+check('an older Host half is reported instead of repeated', outdatedDialog.text.includes('dialog.hostOutdated'), outdatedDialog.text);
+check('an older Host half blocks the click', outdatedConfirm.props.disabled === true);
+
+// Running work: named, and offered as stop-and-delete instead of a refusal.
+fetchReply = { ok: true, status: 200, json: async () => ({ ok: true, active: true, resident: true, missing: false, deletable: false, sizeBytes: 10, descendants: [], activity: [{ kind: 'turn', items: [] }, { kind: 'job', items: [{ id: 'job-1', label: 'Build task' }] }] }) };
+await injected.requestDelete('session-2', 'Busy session');
+await new Promise((resolve) => setTimeout(resolve, 0));
+React.__resetHooks();
+const activeDialog = render(overlay.Component, {
+  ...overlayProps, t: (key, params) => (params === undefined ? key : `${key}(${JSON.stringify(params)})`),
+});
+const activeConfirm = activeDialog.elements.filter((element) => element.type === 'button')
+  .find((element) => String(element.props.className).includes('dsd_danger'));
+check('running work offers a stop-and-delete action', activeConfirm.props.disabled === false
+  && activeDialog.text.includes('dialog.stopAndDelete'), activeDialog.text);
+check('the dialog names the running work families', activeDialog.text.includes('dialog.activity.turn')
+  && activeDialog.text.includes('dialog.activity.job')
+  && activeDialog.text.includes('Build task'), activeDialog.text);
+check('the dialog no longer claims the session is merely "running or open"',
+  !activeDialog.text.includes('dialog.running'), activeDialog.text);
 
 // A cascade is named.
-fetchReply = { ok: true, status: 200, json: async () => ({ ok: true, live: false, missing: false, deletable: true, sizeBytes: 10, descendants: [{ id: 'c1', sizeBytes: 5 }, { id: 'c2', sizeBytes: 5 }] }) };
+fetchReply = { ok: true, status: 200, json: async () => ({ ok: true, active: false, resident: false, missing: false, deletable: true, sizeBytes: 10, descendants: [{ id: 'c1', sizeBytes: 5 }, { id: 'c2', sizeBytes: 5 }], activity: [] }) };
 await injected.requestDelete('session-3', 'Parent session');
 await new Promise((resolve) => setTimeout(resolve, 0));
 React.__resetHooks();
@@ -243,6 +276,8 @@ overlayProps.confirm();
 await new Promise((resolve) => setTimeout(resolve, 0));
 check('confirm posts the delete with the cascade', fetchCalls.some((call) => call.url.endsWith('/session-delete/api/delete')
   && call.body.sessionId === 'session-3' && call.body.includeDescendants === true), JSON.stringify(fetchCalls));
+check('confirm asks the Host to stop activity first', fetchCalls.some((call) => call.url.endsWith('/session-delete/api/delete')
+  && call.body.stopActivity === true), JSON.stringify(fetchCalls));
 check('the browser session catalog is refreshed', refreshed.length === 1, String(refreshed.length));
 
 React.__resetHooks();
@@ -253,7 +288,7 @@ check('a success notice names the removed session', notice.text.includes('Parent
 check('the dialog is gone after success', notice.elements.every((element) => element.props.role !== 'dialog'));
 
 // A rejected delete keeps the dialog open with the reason.
-fetchReply = { ok: false, status: 409, json: async () => ({ ok: false, code: 'live', detail: 'running' }) };
+fetchReply = { ok: false, status: 409, json: async () => ({ ok: false, code: 'active', detail: 'running' }) };
 await injected.requestDelete('session-4', 'Busy session');
 await new Promise((resolve) => setTimeout(resolve, 0));
 overlayProps.confirm();
@@ -263,7 +298,7 @@ const failedDialog = render(overlay.Component, {
   ...overlayProps, t: (key, params) => (params === undefined ? key : `${key}(${JSON.stringify(params)})`),
 });
 check('a rejected delete keeps the dialog open', failedDialog.elements.some((element) => element.props.role === 'dialog'));
-check('the dialog shows the localized refusal', failedDialog.text.includes('error.live'), failedDialog.text);
+check('the dialog shows the localized refusal', failedDialog.text.includes('error.active'), failedDialog.text);
 
 overlayProps.close();
 check('cancel closes the dialog', overlayProps.store.get() === null);

@@ -196,13 +196,75 @@ function collectCascade(rows, id) {
   return found;
 }
 
-function isLive(ctx, id) {
+/**
+ * Resident means the session still has a live in-process instance. That is NOT
+ * the same as running work: the store keeps a session after it was opened, so an
+ * archived, completely idle session can still be resident. Never use this alone
+ * to refuse a deletion.
+ */
+function isResident(ctx, id) {
   const sessions = ctx.get('sessions');
   if (!sessions || typeof sessions.get !== 'function') return false;
   try {
     return sessions.get(id) !== undefined;
   } catch {
     return false;
+  }
+}
+
+function agentOf(ctx, id) {
+  const agents = ctx.get('agents');
+  if (!agents || typeof agents.get !== 'function') return undefined;
+  try {
+    return agents.get(id);
+  } catch {
+    return undefined;
+  }
+}
+
+function normalizeActivity(entries) {
+  const out = [];
+  for (const entry of entries) {
+    if (!entry || typeof entry !== 'object') continue;
+    const kind = typeof entry.kind === 'string' && entry.kind !== '' ? entry.kind : 'other';
+    const items = Array.isArray(entry.items)
+      ? entry.items.map((item) => ({
+        id: item && typeof item.id === 'string' ? item.id : undefined,
+        label: item && typeof item.label === 'string' ? item.label : undefined,
+      }))
+      : [];
+    out.push({ kind, items });
+  }
+  return out;
+}
+
+/**
+ * The Host's own archive-admission question: which work families this session
+ * still runs. Providers answer `turn`, `job`, `subagent` and `schedule`; an
+ * empty answer means there is nothing to stop. The agent-status fallback keeps
+ * the check honest if the waterfall is unavailable.
+ */
+async function activityOf(ctx, id) {
+  if (typeof ctx.waterfall === 'function') {
+    try {
+      const entries = await ctx.waterfall.call(ctx, 'workspace/session-activity', { sessionId: id }, () => Promise.resolve([]));
+      if (Array.isArray(entries)) return normalizeActivity(entries);
+    } catch (error) {
+      log('activity probe failed:', id, msgOf(error));
+    }
+  }
+  const agent = agentOf(ctx, id);
+  return agent !== undefined && agent.status === 'running' ? [{ kind: 'turn', items: [] }] : [];
+}
+
+/** Ask every provider to stop this session's work, exactly as the shipped
+ * stop-and-archive path does. */
+async function stopActivityOf(ctx, id) {
+  if (typeof ctx.parallel !== 'function') return;
+  try {
+    await ctx.parallel.call(ctx, 'workspace/session-stop', { sessionId: id });
+  } catch (error) {
+    log('stop request failed:', id, msgOf(error));
   }
 }
 
@@ -217,14 +279,21 @@ function removeProjectionCache(home, id) {
 }
 
 /** Drop every workspace-side trace of a session that no longer exists on disk.
- * Display bookkeeping only, so failures are logged and never fatal. */
-async function forgetRecord(registry, id) {
+ * Display bookkeeping only, so failures are logged and never fatal.
+ *
+ * A resident session keeps its archived mark on purpose: the archive gate is
+ * what stops a still-live in-process instance from writing a fresh log into the
+ * directory we just removed. The row still leaves the sidebar, because the
+ * session is gone from persistence. */
+async function forgetRecord(registry, id, resident) {
   if (!registry) return;
-  try {
-    const archived = registry.archivedSessionIds;
-    if (Array.isArray(archived) && archived.includes(id)) await registry.unarchiveSession(id);
-  } catch {
-    /* already absent, or the registry refuses an unknown session */
+  if (!resident) {
+    try {
+      const archived = registry.archivedSessionIds;
+      if (Array.isArray(archived) && archived.includes(id)) await registry.unarchiveSession(id);
+    } catch {
+      /* already absent, or the registry refuses an unknown session */
+    }
   }
   try {
     const pinned = registry.pinnedSessionIds;
@@ -292,15 +361,32 @@ export default {
           if (logPath !== undefined) dir = dirname(logPath);
         }
         if (dir === undefined || !existsSync(dir)) dir = findSessionDirByName(root, id);
+        const activity = await activityOf(ctx, id);
         planRows.push({
           id,
           dir,
           missing: dir === undefined,
-          live: isLive(ctx, id),
+          resident: isResident(ctx, id),
+          activity,
+          active: activity.length > 0,
           sizeBytes: dir === undefined ? 0 : directorySize(dir),
         });
       }
       return { planRows, descendants };
+    }
+
+    /** Stop the listed sessions' work and wait briefly for the providers to
+     * settle, so a turn cancelling now does not fail an otherwise valid delete. */
+    async function stopAndWait(rows) {
+      const active = rows.filter((row) => row.active).map((row) => row.id);
+      if (active.length === 0) return;
+      for (const id of active) await stopActivityOf(ctx, id);
+      for (let attempt = 0; attempt < 12; attempt += 1) {
+        const stillActive = [];
+        for (const id of active) if ((await activityOf(ctx, id)).length > 0) stillActive.push(id);
+        if (stillActive.length === 0) return;
+        await new Promise((resolve) => setTimeout(resolve, 250));
+      }
     }
 
     async function handlePreview(req, res) {
@@ -320,16 +406,22 @@ export default {
       apiJson(res, 200, {
         ok: true,
         sessionId: body.sessionId,
-        live: target.live,
+        // `active` is the only refusal: work is running and must be stopped.
+        // `resident` merely explains why the Host still holds the session.
+        active: target.active,
+        resident: target.resident,
+        activity: target.activity,
         missing: target.missing,
         dir: target.dir ?? null,
         sizeBytes: target.sizeBytes,
-        deletable: !target.missing && !target.live,
+        deletable: !target.missing && !target.active,
         descendants: planned.planRows.slice(1).map((row) => ({
           id: row.id,
           sizeBytes: row.sizeBytes,
           missing: row.missing,
-          live: row.live,
+          resident: row.resident,
+          active: row.active,
+          activity: row.activity,
         })),
         sessionsRoot: root,
       });
@@ -342,6 +434,7 @@ export default {
         return;
       }
       const includeDescendants = body.includeDescendants !== false;
+      const stopActivity = body.stopActivity === true;
 
       let planned;
       try {
@@ -351,9 +444,29 @@ export default {
         return;
       }
 
+      const plannedRows = includeDescendants ? planned.planRows : [planned.planRows[0]];
+      if (plannedRows.some((row) => row.active)) {
+        if (!stopActivity) {
+          apiJson(res, 409, {
+            ok: false,
+            code: 'active',
+            detail: '该会话仍有正在运行的工作',
+            activity: plannedRows.filter((row) => row.active).flatMap((row) => row.activity),
+          });
+          return;
+        }
+        await stopAndWait(plannedRows);
+        planned = await plan(body.sessionId);
+      }
+
       const target = planned.planRows[0];
-      if (target.live) {
-        apiJson(res, 409, { ok: false, code: 'live', detail: '该会话正在运行或已打开' });
+      if (target.active) {
+        apiJson(res, 409, {
+          ok: false,
+          code: 'still-active',
+          detail: '停止后仍有工作在执行',
+          activity: target.activity,
+        });
         return;
       }
       if (target.missing) {
@@ -361,7 +474,7 @@ export default {
         return;
       }
 
-      const report = { deleted: [], skippedLive: [], missing: [], failed: [] };
+      const report = { deleted: [], skippedActive: [], missing: [], failed: [] };
       const rows = includeDescendants ? planned.planRows : [target];
 
       // Validate every target before removing anything: a refusal leaves the
@@ -372,8 +485,8 @@ export default {
           report.missing.push(row.id);
           continue;
         }
-        if (row.live) {
-          report.skippedLive.push(row.id);
+        if (row.active) {
+          report.skippedActive.push(row.id);
           continue;
         }
         try {
@@ -399,16 +512,17 @@ export default {
 
       // Bookkeeping after the files are gone: the row must never be hidden
       // while its log is still present.
+      const residentById = new Map(rows.map((row) => [row.id, row.resident === true]));
       for (const id of report.deleted) removeProjectionCache(home, id);
       const registry = ctx.get('workspaceRegistry');
-      for (const id of report.deleted) await forgetRecord(registry, id);
+      for (const id of report.deleted) await forgetRecord(registry, id, residentById.get(id) === true);
 
       const ok = report.deleted.length > 0 && report.failed.length === 0;
       apiJson(res, ok ? 200 : 500, {
         ok,
         sessionId: body.sessionId,
         deleted: report.deleted,
-        skippedLive: report.skippedLive,
+        skippedActive: report.skippedActive,
         missing: report.missing,
         failed: report.failed,
       });

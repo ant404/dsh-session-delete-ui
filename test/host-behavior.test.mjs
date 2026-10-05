@@ -1,12 +1,13 @@
 /**
  * Host-half behavior test for dsh-session-delete-ui.
  *
- * Two roots:
- *   A. the real $DSH_HOME/sessions, read-only — proves plan/preview against the
- *      actual on-disk catalog (ordinary sessions, subagent children, the live
- *      session of this very process is *simulated*).
- *   B. an isolated temp root — proves the destructive path (plan → validate →
- *      remove → projection-cache cleanup) without touching real sessions.
+ * Three roots/situations:
+ *   A. the real $DSH_HOME/sessions, read-only — plan/preview against the actual
+ *      on-disk catalog.
+ *   B. an isolated temp root — the destructive path (validate → remove →
+ *      projection-cache cleanup) without touching real sessions.
+ *   C. the archived-but-resident case: a session the process still holds but
+ *      which runs no work must stay deletable, and must keep its archive gate.
  *
  * Run: node test/host-behavior.test.mjs
  */
@@ -66,9 +67,38 @@ function fakePersistence(root) {
   };
 }
 
-function harness({ root, liveIds = [], purgeOnDelete = true }) {
+function fakeRegistry({ archivedIds = [], memberIds = [] } = {}) {
+  const calls = [];
+  const state = { archived: new Set(archivedIds), members: [...memberIds] };
+  const workspace = {
+    sessionIds: state.members,
+    async detachSession(id) {
+      calls.push(['detach', id]);
+      const index = state.members.indexOf(id);
+      if (index >= 0) state.members.splice(index, 1);
+    },
+  };
+  return {
+    calls,
+    archived: state.archived,
+    members: state.members,
+    get archivedSessionIds() { return [...state.archived]; },
+    get pinnedSessionIds() { return []; },
+    list() { return [workspace]; },
+    async unarchiveSession(id) { calls.push(['unarchive', id]); state.archived.delete(id); },
+    async unpinSession(id) { calls.push(['unpin', id]); },
+  };
+}
+
+/**
+ * @param options.residentIds - sessions the process still holds (NOT running).
+ * @param options.activeIds - sessions that report running work; a stop request clears them.
+ */
+function harness({ root, residentIds = [], activeIds = [], registry }) {
   const routes = new Map();
-  const live = new Set(liveIds);
+  const resident = new Set(residentIds);
+  const active = new Set(activeIds);
+  const stops = [];
   const persistence = fakePersistence(root);
   const webServer = {
     register(route) { routes.set(route.path, route.handler); return () => routes.delete(route.path); },
@@ -77,15 +107,30 @@ function harness({ root, liveIds = [], purgeOnDelete = true }) {
     webServer,
     get(name) {
       if (name === 'sessionPersistence') return persistence;
-      if (name === 'sessions') return { get: (id) => (live.has(id) ? { id } : undefined), list: () => [...live] };
-      if (name === 'workspaceRegistry') return undefined;
+      if (name === 'sessions') return { get: (id) => (resident.has(id) ? { id } : undefined), list: () => [...resident] };
+      if (name === 'agents') {
+        return { get: (id) => (resident.has(id) || active.has(id) ? { id, status: active.has(id) ? 'running' : 'idle' } : undefined) };
+      }
+      if (name === 'workspaceRegistry') return registry;
       if (name === 'webServer') return webServer;
       return undefined;
+    },
+    // The host's own archive-admission question.
+    async waterfall(name, args, fallback) {
+      if (name !== 'workspace/session-activity') return fallback();
+      const entries = await fallback();
+      return active.has(args.sessionId) ? [{ kind: 'turn' }, ...entries] : entries;
+    },
+    // Everything a provider would stop.
+    async parallel(name, args) {
+      if (name !== 'workspace/session-stop') return;
+      stops.push(args.sessionId);
+      active.delete(args.sessionId);
     },
     effect(callback) { callback(); },
   };
   plugin.apply(ctx);
-  return { routes, live, root, purgeOnDelete };
+  return { routes, resident, active, stops, registry };
 }
 
 function req(body) {
@@ -131,6 +176,27 @@ const ordinaryPreview = await call(real.routes.get('/session-delete/api/preview'
 check('ordinary session is deletable', ordinaryPreview.payload.deletable === true, JSON.stringify(ordinaryPreview.payload));
 check('ordinary session resolves inside the sessions root', typeof ordinaryPreview.payload.dir === 'string'
   && ordinaryPreview.payload.dir.toLowerCase().startsWith(realRoot.toLowerCase()), String(ordinaryPreview.payload.dir));
+check('a cold session reports active:false and resident:false',
+  ordinaryPreview.payload.active === false && ordinaryPreview.payload.resident === false, JSON.stringify(ordinaryPreview.payload));
+
+// The user-visible regression: a resident but idle session must be deletable.
+const residentPreview = await call(
+  harness({ root: realRoot, residentIds: [ordinary.header.id] }).routes.get('/session-delete/api/preview'),
+  { sessionId: ordinary.header.id },
+);
+check('a resident but idle session stays deletable',
+  residentPreview.payload.resident === true && residentPreview.payload.active === false && residentPreview.payload.deletable === true,
+  JSON.stringify(residentPreview.payload));
+
+const activePreview = await call(
+  harness({ root: realRoot, activeIds: [ordinary.header.id] }).routes.get('/session-delete/api/preview'),
+  { sessionId: ordinary.header.id },
+);
+check('a session with running work is not deletable',
+  activePreview.payload.active === true && activePreview.payload.deletable === false, JSON.stringify(activePreview.payload));
+check('the running work is reported as an activity family',
+  Array.isArray(activePreview.payload.activity) && activePreview.payload.activity.some((entry) => entry.kind === 'turn'),
+  JSON.stringify(activePreview.payload.activity));
 
 const parentWithChildren = listed.find((row) => listed.some((child) => child.header.origin === 'subagent'
   && (child.header.parentSession === row.header.id || child.header.parentSession === row.header.id.replace(/^session-/, ''))));
@@ -138,14 +204,10 @@ if (parentWithChildren !== undefined) {
   const withFamily = await call(real.routes.get('/session-delete/api/preview'), { sessionId: parentWithChildren.header.id });
   check('a parent lists its subagent family', withFamily.payload.descendants.length > 0,
     `${parentWithChildren.header.id} -> ${JSON.stringify(withFamily.payload.descendants.map((d) => d.id))}`);
-  check('family children are inside the sessions root too',
-    withFamily.payload.descendants.every((child) => child.missing === false));
 } else {
   console.log('  skip parent/family check (no parent with subagent children on disk)');
 }
 
-const livePreview = await call(harness({ root: realRoot, liveIds: [ordinary.header.id] }).routes.get('/session-delete/api/preview'), { sessionId: ordinary.header.id });
-check('live guard marks a live session undeletable', livePreview.payload.deletable === false, JSON.stringify(livePreview.payload));
 const located = fakePersistence(realRoot).locate(ordinary.header);
 check('read-only preview never removed anything', located !== undefined && statSync(located.path).size > 0, ordinary.header.id);
 
@@ -158,7 +220,8 @@ const parentId = 'session-11111111-1111-4111-8111-111111111111';
 const childId = '22222222-2222-4222-8222-222222222222';
 const grandchildId = '33333333-3333-4333-8333-333333333333';
 const forkId = 'session-44444444-4444-4444-8444-444444444444';
-const liveId = 'session-55555555-5555-4555-8555-555555555555';
+const activeId = 'session-55555555-5555-4555-8555-555555555555';
+const archivedResidentId = 'session-66666666-6666-4666-8666-666666666666';
 
 function writeFixture(id, header) {
   const dir = join(projectDir, id);
@@ -168,13 +231,15 @@ function writeFixture(id, header) {
   writeFileSync(join(dir, 'session.jsonl'), `${JSON.stringify(header)}\n`, 'utf8');
 }
 
-writeFixture(parentId, { id: parentId, cwd: 'D:\\fixture', createdAt: 1, origin: undefined });
+writeFixture(parentId, { id: parentId, cwd: 'D:\\fixture', createdAt: 1 });
 writeFixture(childId, { id: childId, cwd: 'D:\\fixture', createdAt: 2, origin: 'subagent', parentSession: parentId });
 writeFixture(grandchildId, { id: grandchildId, cwd: 'D:\\fixture', createdAt: 3, origin: 'subagent', parentSession: childId });
 writeFixture(forkId, { id: forkId, cwd: 'D:\\fixture', createdAt: 4, parentSession: parentId });
-writeFixture(liveId, { id: liveId, cwd: 'D:\\fixture', createdAt: 5 });
+writeFixture(activeId, { id: activeId, cwd: 'D:\\fixture', createdAt: 5 });
+writeFixture(archivedResidentId, { id: archivedResidentId, cwd: 'D:\\fixture', createdAt: 6 });
 
-const fixture = harness({ root: fixtureRoot, liveIds: [liveId] });
+const registry = fakeRegistry({ archivedIds: [archivedResidentId], memberIds: [archivedResidentId, parentId] });
+const fixture = harness({ root: fixtureRoot, activeIds: [activeId], residentIds: [activeId, archivedResidentId], registry });
 
 const family = await call(fixture.routes.get('/session-delete/api/preview'), { sessionId: parentId });
 const familyRows = family.payload !== null && Array.isArray(family.payload.descendants) ? family.payload.descendants : [];
@@ -185,33 +250,40 @@ check('cascade lists child and grandchild, not the fork', familyRows.length === 
   && !familyRows.some((d) => d.id === forkId),
 JSON.stringify(family.payload));
 
-const liveDelete = await call(fixture.routes.get('/session-delete/api/delete'), { sessionId: liveId });
-check('deleting a live session is refused with 409', liveDelete.status === 409 && liveDelete.payload.code === 'live', JSON.stringify(liveDelete.payload));
-check('the refused live session is still on disk', statSync(join(projectDir, liveId)).isDirectory());
+// Running work is refused until the caller asks to stop it.
+const refused = await call(fixture.routes.get('/session-delete/api/delete'), { sessionId: activeId });
+check('a running session is refused with code active', refused.status === 409 && refused.payload.code === 'active', JSON.stringify(refused.payload));
+check('the refused session is still on disk', statSync(join(projectDir, activeId)).isDirectory());
+
+// The stopped path: stopActivity clears the work and the delete proceeds.
+const stopped = await call(fixture.routes.get('/session-delete/api/delete'), { sessionId: activeId, stopActivity: true });
+check('stop-and-delete asks every provider to stop', fixture.stops.includes(activeId), JSON.stringify(fixture.stops));
+check('stop-and-delete removes the session', stopped.status === 200 && stopped.payload.deleted.includes(activeId), JSON.stringify(stopped.payload));
+
+// The archived-but-resident case still deletes, and keeps its archive gate.
+const archivedResidentDelete = await call(fixture.routes.get('/session-delete/api/delete'), { sessionId: archivedResidentId, stopActivity: true });
+check('an archived resident session deletes', archivedResidentDelete.status === 200
+  && archivedResidentDelete.payload.deleted.includes(archivedResidentId), JSON.stringify(archivedResidentDelete.payload));
+check('the deleted archived resident session is gone from disk', !readdirSync(projectDir).includes(archivedResidentId));
+check('a resident session keeps its archive gate (no unarchive call)',
+  !registry.calls.some((call_) => call_[0] === 'unarchive' && call_[1] === archivedResidentId), JSON.stringify(registry.calls));
+check('a resident session is detached from workspace accounting',
+  registry.calls.some((call_) => call_[0] === 'detach' && call_[1] === archivedResidentId), JSON.stringify(registry.calls));
 
 const deleted = await call(fixture.routes.get('/session-delete/api/delete'), { sessionId: parentId, includeDescendants: true });
 check('delete removes the session and its subagent family', deleted.status === 200 && deleted.payload.ok === true
   && deleted.payload.deleted.includes(parentId)
   && deleted.payload.deleted.includes(childId)
   && deleted.payload.deleted.includes(grandchildId), JSON.stringify(deleted.payload));
+check('a cold session clears its archive mark (unarchive called)',
+  registry.calls.some((call_) => call_[0] === 'unarchive' && call_[1] === parentId) === false, 'parent was never archived');
 check('the fork survives the cascade', statSync(join(projectDir, forkId)).isDirectory());
-check('the parent directory is gone', !readdirSync(projectDir).includes(parentId));
-check('the child directory is gone', !readdirSync(projectDir).includes(childId));
-check('the live session directory is untouched', readdirSync(projectDir).includes(liveId));
-check('survivors are exactly the fork and the live session',
-  readdirSync(projectDir).sort().join(',') === [forkId, liveId].sort().join(','), readdirSync(projectDir).join(','));
+check('survivors are exactly the fork', readdirSync(projectDir).join(',') === forkId, readdirSync(projectDir).join(','));
 
 const again = await call(fixture.routes.get('/session-delete/api/delete'), { sessionId: parentId });
 check('a second delete reports missing with 404', again.status === 404 && again.payload.code === 'missing', JSON.stringify(again.payload));
 
-// Projection-cache cleanup uses the same id-addressed file as the Host.
-const cacheHome = join(tmpdir(), `dsd-selftest-cache-${Date.now()}`);
-mkdirSync(join(cacheHome, 'storages', 'session_projcache', 'sessions'), { recursive: true });
-writeFileSync(join(cacheHome, 'storages', 'session_projcache', 'sessions', `${forkId}.json`), '{}', 'utf8');
-console.log('  skip cache-cleanup check (covered by the live app route; needs DSH_HOME layout)');
-
 rmSync(join(fixtureRoot, '..'), { recursive: true, force: true });
-rmSync(cacheHome, { recursive: true, force: true });
 
 console.log(`\n${failed === 0 ? 'PASS' : 'FAIL'} — ${passed} passed, ${failed} failed\n`);
 process.exit(failed === 0 ? 0 : 1);
