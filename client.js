@@ -160,9 +160,14 @@ window.__ModuleLoader__.load({
       return (index === 0 ? String(Math.round(value)) : value.toFixed(1)) + ' ' + units[index];
     }
 
+    /** A slot entry that throws blanks its row, so never assume the locale seat exists. */
+    function translator(props) {
+      return typeof props.t === 'function' ? props.t : function (key) { return key; };
+    }
+
     /** Sidebar row-menu entry: destructive, in its own group after Archive. */
     function DeleteSessionMenuItem(props) {
-      var t = props.t;
+      var t = translator(props);
       var requestDelete = props.requestDelete;
       var useMenuOpenState = props.useMenuOpenState;
       var menu = typeof useMenuOpenState === 'function' ? useMenuOpenState() : [false, function () {}];
@@ -190,7 +195,7 @@ window.__ModuleLoader__.load({
     /** The confirmation dialog and the result toast, both rendered in the frame's
      * overlay slot so they outlive the row menu that opened them. */
     function DeleteOverlay(props) {
-      var t = props.t;
+      var t = translator(props);
       var store = props.store;
       var close = props.close;
       var confirm = props.confirm;

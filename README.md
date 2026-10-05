@@ -116,7 +116,7 @@ New-Item -ItemType Junction `
 | 检查 | 结果 |
 |---|---|
 | Host 行为测试 `node test/host-behavior.test.mjs` | **21/21 通过**：真实 sessions 根只读预检 + 隔离夹具上的真实删除与级联、存活拒绝、路径穿越拒绝、重复删除 404 |
-| Client 渲染测试 `node test/client-render.test.mjs` | **34/34 通过**：模块注册、两个 slot 的 id/order/locale、菜单项与对话框渲染、存活禁用、级联提示、确认→刷新→提示、失败保留对话框 |
+| Client 渲染测试 `node test/client-render.test.mjs` | **35/35 通过**：模块注册、两个 slot 的 id/order/locale、菜单项与对话框渲染、存活禁用、级联提示、确认→刷新→提示、失败保留对话框、缺失 locale 时仍能渲染 |
 | 运行中的应用 | Host 已实时挂载：`GET /session-delete/api/health` → 200 |
 | 真实路由 | 当前会话 preview → `live: true, deletable: false`；`delete` → **409**；非存活会话 preview → `deletable: true` 并给出真实目录与体积 |
 | 浏览器 Bundle | 按 `dsh-client-modules` 的 combo 规则计算 rev 后请求 → **200**（20974 字节），说明模块图已包含本插件的行 |
@@ -155,7 +155,7 @@ dsh-session-delete-ui/
 ├── icon.svg / locale/{zh,en}.json  插件管理器卡片
 └── test/
     ├── host-behavior.test.mjs    Host 行为测试（21 项）
-    └── client-render.test.mjs    Client 渲染测试（34 项）
+    └── client-render.test.mjs    Client 渲染测试（35 项）
 ```
 
 ## License
@@ -178,7 +178,7 @@ removes the log directory and the projection cache, and only then drops workspac
 Subagent descendants cascade; forked sessions never do. Files first, bookkeeping second.
 
 Verified locally: 21/21 host checks (real read-only planning + destructive run on an isolated
-fixture), 34/34 client checks (registration, rendering, guards, confirm flow), the live Host route
+fixture), 35/35 client checks (registration, rendering, guards, confirm flow), the live Host route
 (`GET /session-delete/api/health` → 200, live session delete → 409), and the served browser bundle
 (combo URL computed from `dsh-client-modules`' revision rule → 200). Visual appearance in the page
 was not verified: this session has no browser control.

@@ -166,6 +166,14 @@ check('the row is a menu item', menuButton.props.role === 'menuitem');
 check('the row shows the delete label', menuView.text.includes('menu.delete'), menuView.text);
 check('the row draws its own stylesheet once', menuView.elements.some((element) => element.type === 'style'));
 
+React.__resetHooks();
+const withoutLocale = render(menu.Component, {
+  sessionId: 'session-1',
+  displayTitle: 'My session',
+  requestDelete: injected.requestDelete,
+});
+check('the row survives a missing locale seat', withoutLocale.text.includes('menu.delete'), withoutLocale.text);
+
 // --------------------------------------------------------------------------
 console.log('\ndialog');
 
