@@ -43,7 +43,7 @@ resident 但空闲的会话直接可删。
 设置 → 插件 → 安装 bundle，目标填本目录的绝对路径：
 
 ```
-D:\sysdir\Documents\deepseek-harness-workspace\dsh-session-delete-ui
+D:\path\to\dsh-session-delete-ui
 ```
 
 **方式二：手动接入 profile（本仓库当前采用的方式）**
@@ -56,7 +56,7 @@ D:\sysdir\Documents\deepseek-harness-workspace\dsh-session-delete-ui
 # 1. 在 profile 的 node_modules 里建立软链（hoisted 布局，直接 junction 即可）
 New-Item -ItemType Junction `
   -Path "$env:USERPROFILE\.dsh\profiles\desktop\node_modules\dsh-session-delete-ui" `
-  -Target "D:\sysdir\Documents\deepseek-harness-workspace\dsh-session-delete-ui"
+  -Target "D:\path\to\dsh-session-delete-ui"
 
 # 2. 在 profile 的 package.json 里登记依赖 + bundle
 #    dependencies: "dsh-session-delete-ui": "link:D:/.../dsh-session-delete-ui"

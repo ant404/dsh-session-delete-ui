@@ -12,7 +12,7 @@
  * Run: node test/host-behavior.test.mjs
  */
 import { mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { zstdDecompressSync } from 'node:zlib';
 
@@ -155,7 +155,7 @@ async function call(route, body) {
 // ---------------------------------------------------------------------------
 console.log('\n[A] real sessions root, read-only planning');
 
-const home = process.env.DSH_HOME || 'C:\\Users\\ZhouJiaWei\\.dsh';
+const home = process.env.DSH_HOME || join(homedir(), '.dsh');
 const realRoot = join(home, 'sessions');
 const real = harness({ root: realRoot });
 
